@@ -156,7 +156,8 @@ class Network(nn.Module):
         # stage 2: variable filtering + sparse interaction
         if self.use_trend_interactor:
             topk_idx, topk_scores, _ = self.variable_filter(t)
-            t = self.trend_interactor(t, topk_idx, topk_scores)
+            delta_t = self.trend_interactor(t, topk_idx, topk_scores)
+            t = t + 0.1 * delta_t
 
         # stage 3: trend head
         t = self.fc7(t)           # [B, C, pred_len]
