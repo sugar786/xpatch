@@ -73,6 +73,9 @@ parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple g
 parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
 parser.add_argument('--test_flop', action='store_true', default=False, help='See utils/tools for usage')
 
+parser.add_argument('--use_trend_interactor', type=int, default=0, help='use sparse trend variable interaction')
+parser.add_argument('--topk', type=int, default=4, help='top-k candidate variables for each target variable')
+parser.add_argument('--interactor_dropout', type=float, default=0.0, help='dropout for trend interactor')
 args = parser.parse_args()
 
 args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
