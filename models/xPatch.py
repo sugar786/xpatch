@@ -4,8 +4,6 @@ import math
 
 from layers.decomp import DECOMP
 from layers.network import Network
-# from layers.network_mlp import NetworkMLP # For ablation study with MLP-only stream
-# from layers.network_cnn import NetworkCNN # For ablation study with CNN-only stream
 from layers.revin import RevIN
 
 class Model(nn.Module):
@@ -32,9 +30,17 @@ class Model(nn.Module):
         beta = configs.beta         # smoothing factor for DEMA (Double Exponential Moving Average)
 
         self.decomp = DECOMP(self.ma_type, alpha, beta)
-        self.net = Network(seq_len, pred_len, patch_len, stride, padding_patch)
-        # self.net_mlp = NetworkMLP(seq_len, pred_len) # For ablation study with MLP-only stream
-        # self.net_cnn = NetworkCNN(seq_len, pred_len, patch_len, stride, padding_patch) # For ablation study with CNN-only stream
+        self.net = Network(
+            seq_len,
+            pred_len,
+            patch_len,
+            stride,
+            padding_patch,
+            use_trend_interactor=getattr(configs, 'use_trend_interactor', False),
+            topk=getattr(configs, 'topk', 4),
+            interactor_dropout=getattr(configs, 'interactor_dropout', 0.0)
+        )
+        
 
     def forward(self, x):
         # x: [Batch, Input, Channel]
@@ -45,8 +51,6 @@ class Model(nn.Module):
 
         if self.ma_type == 'reg':   # If no decomposition, directly pass the input to the network
             x = self.net(x, x)
-            # x = self.net_mlp(x) # For ablation study with MLP-only stream
-            # x = self.net_cnn(x) # For ablation study with CNN-only stream
         else:
             seasonal_init, trend_init = self.decomp(x)
             x = self.net(seasonal_init, trend_init)
