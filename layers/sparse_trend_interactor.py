@@ -43,6 +43,6 @@ class SparseTrendInteractor(nn.Module):
         agg = (attn * neigh).sum(dim=2)                                        # [B, C, D]
 
         gate = torch.sigmoid(self.gate_proj(torch.cat([h, agg], dim=-1)))     # [B, C, D]
-        out = h + gate * self.out_proj(agg)                                    # [B, C, D]
-
-        return out
+        delta = gate * self.out_proj(agg)
+        
+        return delta
