@@ -78,7 +78,6 @@ class Network(nn.Module):
         # Prediction-level Trend Correction
         # =========================
         if self.use_trend_interactor:
-            # now we filter with raw trend + predicted trend
             self.variable_filter = VariableFilter(
                 d_model=self.pred_len,
                 topk=self.topk,
@@ -91,6 +90,7 @@ class Network(nn.Module):
                 d_model=self.pred_len,
                 dropout=interactor_dropout
             )
+            self.trend_corr_gate = nn.Linear(self.pred_len * 2, self.pred_len)
 
         # =========================
         # Streams Concatenation
@@ -165,12 +165,17 @@ class Network(nn.Module):
         t = self.fc7(t)           # [B, C, pred_len]
 
         # -------------------------
-        # prediction-level sparse correction
+        # prediction-level sparse correction + gate
         # -------------------------
         if self.use_trend_interactor:
             topk_idx, topk_scores, _ = self.variable_filter(t_raw, t)
             delta_t = self.trend_interactor(t, topk_idx, topk_scores)
-            t = t + 0.1 * delta_t
+
+            gate = torch.sigmoid(
+                self.trend_corr_gate(torch.cat([t, delta_t], dim=-1))
+            )  # [B, C, pred_len]
+
+            t = t + 0.1 * gate * delta_t
 
         return t
 
