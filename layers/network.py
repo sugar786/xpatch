@@ -78,7 +78,9 @@ class Network(nn.Module):
             self.variable_filter = VariableFilter(
                 d_model=self.trend_hidden_dim,
                 topk=self.topk,
-                dropout=interactor_dropout
+                dropout=interactor_dropout,
+                sim_sigma=1.0,
+                learnable_weight=0.3
             )
             self.trend_interactor = SparseTrendInteractor(
                 d_model=self.trend_hidden_dim,
