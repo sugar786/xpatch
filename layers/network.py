@@ -79,8 +79,9 @@ class Network(nn.Module):
                 d_model=self.trend_hidden_dim,
                 topk=self.topk,
                 dropout=interactor_dropout,
-                sim_sigma=1.0,
-                learnable_weight=0.3
+                learnable_weight=0.1,
+                use_lag_corr=True,
+                max_lag=3
             )
             self.trend_interactor = SparseTrendInteractor(
                 d_model=self.trend_hidden_dim,
@@ -146,6 +147,8 @@ class Network(nn.Module):
         t: [B, C, L]
         return: [B, C, pred_len]
         """
+        t_raw = t
+
         # stage 1: trend encoder
         t = self.fc5(t)           # [B, C, pred_len*4]
         t = self.avgpool1(t)      # [B, C, pred_len*2]
@@ -157,7 +160,7 @@ class Network(nn.Module):
 
         # stage 2: variable filtering + sparse interaction
         if self.use_trend_interactor:
-            topk_idx, topk_scores, _ = self.variable_filter(t)
+            topk_idx, topk_scores, _ = self.variable_filter(t_raw, t)
             delta_t = self.trend_interactor(t, topk_idx, topk_scores)
             t = t + 0.1 * delta_t
 
