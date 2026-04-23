@@ -60,7 +60,8 @@ class Network(nn.Module):
         self.fc4 = nn.Linear(pred_len * 2, pred_len)
 
         # =========================
-        # Linear Trend Stream (original xPatch)
+        # Linear Trend Stream
+        # keep original xPatch trend encoder intact
         # =========================
         self.fc5 = nn.Linear(seq_len, pred_len * 4)
         self.avgpool1 = nn.AvgPool1d(kernel_size=2)
@@ -70,30 +71,29 @@ class Network(nn.Module):
         self.avgpool2 = nn.AvgPool1d(kernel_size=2)
         self.ln2 = nn.LayerNorm(pred_len // 2)
 
+        # original trend prediction head
         self.fc7 = nn.Linear(pred_len // 2, pred_len)
 
         # =========================
-        # Fusion-level Variable Correction
+        # Prediction-level Trend Correction
         # =========================
-        self.fusion_dim = pred_len * 2
-
         if self.use_trend_interactor:
-            self.fusion_filter = VariableFilter(
-                d_model=self.fusion_dim,
+            # now we filter with raw trend + predicted trend
+            self.variable_filter = VariableFilter(
+                d_model=self.pred_len,
                 topk=self.topk,
                 dropout=interactor_dropout,
                 learnable_weight=0.1,
                 use_lag_corr=True,
                 max_lag=3
             )
-            self.fusion_interactor = SparseTrendInteractor(
-                d_model=self.fusion_dim,
+            self.trend_interactor = SparseTrendInteractor(
+                d_model=self.pred_len,
                 dropout=interactor_dropout
             )
-            self.fusion_corr_gate = nn.Linear(self.fusion_dim * 2, self.fusion_dim)
 
         # =========================
-        # Final Fusion Head
+        # Streams Concatenation
         # =========================
         self.fc8 = nn.Linear(pred_len * 2, pred_len)
 
@@ -148,7 +148,11 @@ class Network(nn.Module):
         t: [B, C, L]
         return: [B, C, pred_len]
         """
-        # original xPatch trend branch, keep untouched
+        t_raw = t  # keep raw trend for statistical filtering
+
+        # -------------------------
+        # original xPatch trend encoder
+        # -------------------------
         t = self.fc5(t)           # [B, C, pred_len*4]
         t = self.avgpool1(t)      # [B, C, pred_len*2]
         t = self.ln1(t)
@@ -157,15 +161,22 @@ class Network(nn.Module):
         t = self.avgpool2(t)      # [B, C, pred_len//2]
         t = self.ln2(t)
 
+        # original trend prediction
         t = self.fc7(t)           # [B, C, pred_len]
+
+        # -------------------------
+        # prediction-level sparse correction
+        # -------------------------
+        if self.use_trend_interactor:
+            topk_idx, topk_scores, _ = self.variable_filter(t_raw, t)
+            delta_t = self.trend_interactor(t, topk_idx, topk_scores)
+            t = t + 0.1 * delta_t
+
         return t
 
     def forward(self, s, t):
         # s - seasonality: [B, L, C]
         # t - trend:       [B, L, C]
-
-        # keep raw trend for filter prior
-        t_raw = t.permute(0, 2, 1)   # [B, C, L]
 
         # to [B, C, L]
         s = s.permute(0, 2, 1)
@@ -177,22 +188,9 @@ class Network(nn.Module):
         # trend stream
         t_out = self._trend_stream(t)      # [B, C, pred_len]
 
-        # fusion feature before final output
-        x = torch.cat((s_out, t_out), dim=-1)   # [B, C, 2*pred_len]
-
-        # fusion-level sparse correction
-        if self.use_trend_interactor:
-            topk_idx, topk_scores, _ = self.fusion_filter(t_raw, x)
-            delta_x = self.fusion_interactor(x, topk_idx, topk_scores)
-
-            gate = torch.sigmoid(
-                self.fusion_corr_gate(torch.cat([x, delta_x], dim=-1))
-            )  # [B, C, 2*pred_len]
-
-            x = x + 0.1 * gate * delta_x
-
-        # final projection
-        x = self.fc8(x)   # [B, C, pred_len]
+        # streams concatenation
+        x = torch.cat((s_out, t_out), dim=-1)  # [B, C, pred_len*2]
+        x = self.fc8(x)                        # [B, C, pred_len]
 
         # back to [B, pred_len, C]
         x = x.permute(0, 2, 1)
