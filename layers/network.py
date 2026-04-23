@@ -61,8 +61,8 @@ class Network(nn.Module):
 
         # =========================
         # Linear Trend Stream
-        # keep original xPatch trend encoder intact
         # =========================
+        # stage 1: trend encoder (works on [B, C, L] -> [B, C, D])
         self.fc5 = nn.Linear(seq_len, pred_len * 4)
         self.avgpool1 = nn.AvgPool1d(kernel_size=2)
         self.ln1 = nn.LayerNorm(pred_len * 2)
@@ -71,16 +71,13 @@ class Network(nn.Module):
         self.avgpool2 = nn.AvgPool1d(kernel_size=2)
         self.ln2 = nn.LayerNorm(pred_len // 2)
 
-        # original trend prediction head
-        self.fc7 = nn.Linear(pred_len // 2, pred_len)
+        # hidden dim for trend interaction
+        self.trend_hidden_dim = pred_len // 2
 
-        # =========================
-        # Prediction-level Trend Correction
-        # =========================
+        # optional variable filter + sparse interactor on trend hidden states
         if self.use_trend_interactor:
-            # now we filter with raw trend + predicted trend
             self.variable_filter = VariableFilter(
-                d_model=self.pred_len,
+                d_model=self.trend_hidden_dim,
                 topk=self.topk,
                 dropout=interactor_dropout,
                 learnable_weight=0.1,
@@ -88,9 +85,12 @@ class Network(nn.Module):
                 max_lag=3
             )
             self.trend_interactor = SparseTrendInteractor(
-                d_model=self.pred_len,
+                d_model=self.trend_hidden_dim,
                 dropout=interactor_dropout
             )
+
+        # stage 2: trend head ([B, C, D] -> [B, C, pred_len])
+        self.fc7 = nn.Linear(pred_len // 2, pred_len)
 
         # =========================
         # Streams Concatenation
@@ -104,7 +104,7 @@ class Network(nn.Module):
         """
         B, C, I = s.shape
 
-        # channel split for channel independence
+        # channel split for channel independence on seasonal stream
         s = torch.reshape(s, (B * C, I))  # [B*C, L]
 
         # patching
@@ -148,30 +148,25 @@ class Network(nn.Module):
         t: [B, C, L]
         return: [B, C, pred_len]
         """
-        t_raw = t  # keep raw trend for statistical filtering
+        t_raw = t
 
-        # -------------------------
-        # original xPatch trend encoder
-        # -------------------------
+        # stage 1: trend encoder
         t = self.fc5(t)           # [B, C, pred_len*4]
         t = self.avgpool1(t)      # [B, C, pred_len*2]
         t = self.ln1(t)
 
         t = self.fc6(t)           # [B, C, pred_len]
         t = self.avgpool2(t)      # [B, C, pred_len//2]
-        t = self.ln2(t)
+        t = self.ln2(t)           # [B, C, pred_len//2]
 
-        # original trend prediction
-        t = self.fc7(t)           # [B, C, pred_len]
-
-        # -------------------------
-        # prediction-level sparse correction
-        # -------------------------
+        # stage 2: variable filtering + sparse interaction on hidden states
         if self.use_trend_interactor:
             topk_idx, topk_scores, _ = self.variable_filter(t_raw, t)
             delta_t = self.trend_interactor(t, topk_idx, topk_scores)
             t = t + 0.1 * delta_t
 
+        # stage 3: trend head
+        t = self.fc7(t)           # [B, C, pred_len]
         return t
 
     def forward(self, s, t):
