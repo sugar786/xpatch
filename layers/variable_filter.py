@@ -10,13 +10,13 @@ class VariableFilter(nn.Module):
     Key design:
     1. Use absolute correlation magnitude for top-k neighbor selection,
        so strong negative correlations will not be ignored.
-    2. Return signed scores for downstream interaction,
-       so the interactor can preserve positive / negative dependency direction.
+    2. Return signed finite scores for downstream modules.
+       The interactor may choose to use score magnitude only or signed score.
     3. Keep all returned scores finite to avoid NaN in softmax.
 
     Inputs:
-        t_raw:    [B, C, L]   raw trend sequence
-        t_hidden: [B, C, D]   encoded trend representation
+        t_raw:    [B, C, L]   raw sequence used for statistical filtering
+        h:        [B, C, D]   representation used for learnable auxiliary score
 
     Outputs:
         topk_idx:           [B, C, K]
@@ -102,16 +102,16 @@ class VariableFilter(nn.Module):
         lag_corr = torch.gather(lag_stack, dim=0, index=best_lag_idx).squeeze(0)
         return lag_corr
 
-    def forward(self, t_raw: torch.Tensor, t_hidden: torch.Tensor):
+    def forward(self, t_raw: torch.Tensor, h: torch.Tensor):
         """
-        t_raw:    [B, C, L]
-        t_hidden: [B, C, D]
+        t_raw: [B, C, L]
+        h:     [B, C, D]
         """
         B, C, _ = t_raw.shape
-        D = t_hidden.shape[-1]
+        D = h.shape[-1]
 
         # -------------------------
-        # 1) Statistical prior from raw trend
+        # 1) Statistical prior from raw sequence
         # -------------------------
         x = self._normalize_ts(t_raw)
         corr_scores = self._pearson_corr(x)  # [B, C, C]
@@ -125,8 +125,8 @@ class VariableFilter(nn.Module):
         # -------------------------
         # 2) Weak learnable auxiliary score
         # -------------------------
-        q = self.q_proj(t_hidden)
-        k = self.k_proj(t_hidden)
+        q = self.q_proj(h)
+        k = self.k_proj(h)
         learnable_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(D)
 
         # -------------------------
