@@ -80,31 +80,34 @@ class Network(nn.Module):
         self.avgpool2 = nn.AvgPool1d(kernel_size=2)
         self.ln2 = nn.LayerNorm(pred_len // 2)
 
-        # Hidden dimension for trend interaction.
-        self.trend_hidden_dim = pred_len // 2
+        # stage 2: trend head ([B, C, D] -> [B, C, pred_len])
+        self.fc7 = nn.Linear(pred_len // 2, pred_len)
 
-        # Optional variable filter + sparse interactor on trend hidden states.
+        # =========================
+        # Prediction-level variable correction
+        # =========================
+        # The correction is applied after seasonal and trend streams have
+        # produced prediction-level features, instead of inside trend hidden states.
         if self.use_trend_interactor:
+            self.pred_interactor_dim = pred_len * 2
+
             self.variable_filter = VariableFilter(
-                d_model=self.trend_hidden_dim,
+                d_model=self.pred_interactor_dim,
                 topk=self.topk,
                 dropout=interactor_dropout,
                 learnable_weight=0.1,
                 use_lag_corr=True,
                 max_lag=3,
             )
-            self.trend_interactor = SparseTrendInteractor(
-                d_model=self.trend_hidden_dim,
+            self.pred_interactor = SparseTrendInteractor(
+                d_model=self.pred_interactor_dim,
                 dropout=interactor_dropout,
             )
 
-            # Learnable global residual strength.
-            # sigmoid(-4.0) ~= 0.018, so the model starts close to original xPatch.
-            # If cross-variable interaction is useful, training can increase it.
-            self.interactor_alpha = nn.Parameter(torch.tensor(-4.0))
-
-        # stage 2: trend head ([B, C, D] -> [B, C, pred_len])
-        self.fc7 = nn.Linear(pred_len // 2, pred_len)
+            # Initialize to roughly 0.1, matching the previous fixed residual strength,
+            # but keep it learnable.
+            # sigmoid(-2.2) ~= 0.10.
+            self.interactor_alpha = nn.Parameter(torch.tensor(-2.2))
 
         # =========================
         # Streams Concatenation
@@ -163,8 +166,6 @@ class Network(nn.Module):
         t: [B, C, L]
         return: [B, C, pred_len]
         """
-        t_raw = t
-
         # stage 1: trend encoder
         t = self.fc5(t)       # [B, C, pred_len*4]
         t = self.avgpool1(t)  # [B, C, pred_len*2]
@@ -174,16 +175,7 @@ class Network(nn.Module):
         t = self.avgpool2(t)  # [B, C, pred_len//2]
         t = self.ln2(t)       # [B, C, pred_len//2]
 
-        # stage 2: variable filtering + sparse interaction on hidden states
-        if self.use_trend_interactor:
-            topk_idx, topk_scores, _ = self.variable_filter(t_raw, t)
-            delta_t = self.trend_interactor(t, topk_idx, topk_scores)
-
-            # Learnable residual gate instead of fixed 0.1.
-            alpha = torch.sigmoid(self.interactor_alpha)
-            t = t + alpha * delta_t
-
-        # stage 3: trend head
+        # stage 2: trend head
         t = self.fc7(t)       # [B, C, pred_len]
         return t
 
@@ -197,15 +189,29 @@ class Network(nn.Module):
         s = s.permute(0, 2, 1)
         t = t.permute(0, 2, 1)
 
+        # Save raw trend for statistical filtering.
+        # Shape: [B, C, L]
+        t_raw = t
+
         # seasonal stream
         s_out = self._seasonal_stream(s)  # [B, C, pred_len]
 
         # trend stream
         t_out = self._trend_stream(t)     # [B, C, pred_len]
 
-        # streams concatenation
-        x = torch.cat((s_out, t_out), dim=-1)  # [B, C, pred_len*2]
-        x = self.fc8(x)                        # [B, C, pred_len]
+        # Prediction-level feature before final projection.
+        x_feat = torch.cat((s_out, t_out), dim=-1)  # [B, C, pred_len*2]
+
+        # Prediction-level sparse variable correction.
+        if self.use_trend_interactor:
+            topk_idx, topk_scores, _ = self.variable_filter(t_raw, x_feat)
+            delta = self.pred_interactor(x_feat, topk_idx, topk_scores)
+
+            alpha = torch.sigmoid(self.interactor_alpha)
+            x_feat = x_feat + alpha * delta
+
+        # final prediction projection
+        x = self.fc8(x_feat)  # [B, C, pred_len]
 
         # back to [B, pred_len, C]
         x = x.permute(0, 2, 1)
