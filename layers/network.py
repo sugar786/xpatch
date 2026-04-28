@@ -6,8 +6,17 @@ from layers.sparse_trend_interactor import SparseTrendInteractor
 
 
 class Network(nn.Module):
-    def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch,
-                 use_trend_interactor=False, topk=4, interactor_dropout=0.0):
+    def __init__(
+        self,
+        seq_len,
+        pred_len,
+        patch_len,
+        stride,
+        padding_patch,
+        use_trend_interactor=False,
+        topk=4,
+        interactor_dropout=0.0,
+    ):
         super(Network, self).__init__()
 
         # Parameters
@@ -25,7 +34,7 @@ class Network(nn.Module):
         self.dim = patch_len * patch_len
         self.patch_num = (seq_len - patch_len) // stride + 1
 
-        if padding_patch == 'end':
+        if padding_patch == "end":
             self.padding_patch_layer = nn.ReplicationPad1d((0, stride))
             self.patch_num += 1
 
@@ -40,7 +49,7 @@ class Network(nn.Module):
             self.patch_num,
             kernel_size=patch_len,
             stride=patch_len,
-            groups=self.patch_num
+            groups=self.patch_num,
         )
         self.gelu2 = nn.GELU()
         self.bn2 = nn.BatchNorm1d(self.patch_num)
@@ -62,7 +71,7 @@ class Network(nn.Module):
         # =========================
         # Linear Trend Stream
         # =========================
-        # stage 1: trend encoder (works on [B, C, L] -> [B, C, D])
+        # stage 1: trend encoder ([B, C, L] -> [B, C, D])
         self.fc5 = nn.Linear(seq_len, pred_len * 4)
         self.avgpool1 = nn.AvgPool1d(kernel_size=2)
         self.ln1 = nn.LayerNorm(pred_len * 2)
@@ -71,10 +80,10 @@ class Network(nn.Module):
         self.avgpool2 = nn.AvgPool1d(kernel_size=2)
         self.ln2 = nn.LayerNorm(pred_len // 2)
 
-        # hidden dim for trend interaction
+        # Hidden dimension for trend interaction.
         self.trend_hidden_dim = pred_len // 2
 
-        # optional variable filter + sparse interactor on trend hidden states
+        # Optional variable filter + sparse interactor on trend hidden states.
         if self.use_trend_interactor:
             self.variable_filter = VariableFilter(
                 d_model=self.trend_hidden_dim,
@@ -82,12 +91,17 @@ class Network(nn.Module):
                 dropout=interactor_dropout,
                 learnable_weight=0.1,
                 use_lag_corr=True,
-                max_lag=3
+                max_lag=3,
             )
             self.trend_interactor = SparseTrendInteractor(
                 d_model=self.trend_hidden_dim,
-                dropout=interactor_dropout
+                dropout=interactor_dropout,
             )
+
+            # Learnable global residual strength.
+            # sigmoid(-4.0) ~= 0.018, so the model starts close to original xPatch.
+            # If cross-variable interaction is useful, training can increase it.
+            self.interactor_alpha = nn.Parameter(torch.tensor(-4.0))
 
         # stage 2: trend head ([B, C, D] -> [B, C, pred_len])
         self.fc7 = nn.Linear(pred_len // 2, pred_len)
@@ -104,37 +118,38 @@ class Network(nn.Module):
         """
         B, C, I = s.shape
 
-        # channel split for channel independence on seasonal stream
+        # Channel split for channel independence on seasonal stream.
         s = torch.reshape(s, (B * C, I))  # [B*C, L]
 
-        # patching
-        if self.padding_patch == 'end':
+        # Patching.
+        if self.padding_patch == "end":
             s = self.padding_patch_layer(s)
+
         s = s.unfold(dimension=-1, size=self.patch_len, step=self.stride)
         # [B*C, patch_num, patch_len]
 
-        # patch embedding
+        # Patch embedding.
         s = self.fc1(s)
         s = self.gelu1(s)
         s = self.bn1(s)
 
         res = s
 
-        # depthwise conv
+        # Depthwise conv.
         s = self.conv1(s)
         s = self.gelu2(s)
         s = self.bn2(s)
 
-        # residual stream
+        # Residual stream.
         res = self.fc2(res)
         s = s + res
 
-        # pointwise conv
+        # Pointwise conv.
         s = self.conv2(s)
         s = self.gelu3(s)
         s = self.bn3(s)
 
-        # flatten head
+        # Flatten head.
         s = self.flatten1(s)
         s = self.fc3(s)
         s = self.gelu4(s)
@@ -151,37 +166,42 @@ class Network(nn.Module):
         t_raw = t
 
         # stage 1: trend encoder
-        t = self.fc5(t)           # [B, C, pred_len*4]
-        t = self.avgpool1(t)      # [B, C, pred_len*2]
+        t = self.fc5(t)       # [B, C, pred_len*4]
+        t = self.avgpool1(t)  # [B, C, pred_len*2]
         t = self.ln1(t)
 
-        t = self.fc6(t)           # [B, C, pred_len]
-        t = self.avgpool2(t)      # [B, C, pred_len//2]
-        t = self.ln2(t)           # [B, C, pred_len//2]
+        t = self.fc6(t)       # [B, C, pred_len]
+        t = self.avgpool2(t)  # [B, C, pred_len//2]
+        t = self.ln2(t)       # [B, C, pred_len//2]
 
         # stage 2: variable filtering + sparse interaction on hidden states
         if self.use_trend_interactor:
             topk_idx, topk_scores, _ = self.variable_filter(t_raw, t)
             delta_t = self.trend_interactor(t, topk_idx, topk_scores)
-            t = t + 0.1 * delta_t
+
+            # Learnable residual gate instead of fixed 0.1.
+            alpha = torch.sigmoid(self.interactor_alpha)
+            t = t + alpha * delta_t
 
         # stage 3: trend head
-        t = self.fc7(t)           # [B, C, pred_len]
+        t = self.fc7(t)       # [B, C, pred_len]
         return t
 
     def forward(self, s, t):
-        # s - seasonality: [B, L, C]
-        # t - trend:       [B, L, C]
+        """
+        s - seasonality: [B, L, C]
+        t - trend:       [B, L, C]
+        """
 
         # to [B, C, L]
         s = s.permute(0, 2, 1)
         t = t.permute(0, 2, 1)
 
         # seasonal stream
-        s_out = self._seasonal_stream(s)   # [B, C, pred_len]
+        s_out = self._seasonal_stream(s)  # [B, C, pred_len]
 
         # trend stream
-        t_out = self._trend_stream(t)      # [B, C, pred_len]
+        t_out = self._trend_stream(t)     # [B, C, pred_len]
 
         # streams concatenation
         x = torch.cat((s_out, t_out), dim=-1)  # [B, C, pred_len*2]
