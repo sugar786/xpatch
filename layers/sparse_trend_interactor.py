@@ -4,7 +4,12 @@ import torch.nn as nn
 
 class SparseTrendInteractor(nn.Module):
     """
-    Sparse cross-variable interaction on filtered trend representations.
+    Sparse cross-variable interaction on filtered variable representations.
+
+    This conservative version uses score magnitude as attention strength.
+    It does NOT multiply neighbor hidden states by sign(score), because
+    negative correlation does not necessarily mean the latent representation
+    should be directly negated.
 
     Input:
         h:           [B, C, D]
@@ -32,7 +37,7 @@ class SparseTrendInteractor(nn.Module):
         """
         h:           [B, C, D]
         topk_idx:    [B, C, K]
-        topk_scores: [B, C, K], signed
+        topk_scores: [B, C, K]
         """
         B, C, D = h.shape
         K = topk_idx.shape[-1]
@@ -56,17 +61,12 @@ class SparseTrendInteractor(nn.Module):
         # Project neighbor features.
         neigh = self.v_proj(neigh)                                 # [B, C, K, D]
 
-        # Use absolute score for attention strength,
-        # and sign(score) for message direction.
+        # Conservative aggregation:
+        # use absolute score as dependency strength only.
         attn = torch.softmax(topk_scores.abs(), dim=-1).unsqueeze(-1)  # [B, C, K, 1]
-        sign = topk_scores.sign().unsqueeze(-1)                        # [B, C, K, 1]
-
         attn = self.dropout(attn)
 
-        # Signed aggregation:
-        # positively correlated variables send positive messages;
-        # negatively correlated variables send reverse messages.
-        agg = (attn * sign * neigh).sum(dim=2)                     # [B, C, D]
+        agg = (attn * neigh).sum(dim=2)                            # [B, C, D]
 
         # Feature-wise gated residual message.
         gate = torch.sigmoid(self.gate_proj(torch.cat([h, agg], dim=-1)))
