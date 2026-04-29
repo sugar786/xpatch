@@ -4,75 +4,45 @@ import torch.nn as nn
 
 class SparseTrendInteractor(nn.Module):
     """
-    Sparse cross-variable interaction on filtered variable representations.
-
-    This conservative version uses score magnitude as attention strength.
-    It does NOT multiply neighbor hidden states by sign(score), because
-    negative correlation does not necessarily mean the latent representation
-    should be directly negated.
+    Sparse cross-variable interaction on filtered trend representations.
 
     Input:
         h:           [B, C, D]
         topk_idx:    [B, C, K]
-        topk_scores: [B, C, K] signed finite scores
+        topk_scores: [B, C, K]
 
     Output:
-        delta:       [B, C, D]
+        out:         [B, C, D]
     """
-
     def __init__(self, d_model: int, dropout: float = 0.0):
         super().__init__()
-
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         self.gate_proj = nn.Linear(d_model * 2, d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        h: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_scores: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, topk_idx: torch.Tensor, topk_scores: torch.Tensor):
         """
-        h:           [B, C, D]
-        topk_idx:    [B, C, K]
+        h: [B, C, D]
+        topk_idx: [B, C, K]
         topk_scores: [B, C, K]
         """
         B, C, D = h.shape
         K = topk_idx.shape[-1]
 
-        if K == 0:
-            return torch.zeros_like(h)
+        # gather neighbors
+        h_expand = h.unsqueeze(1).expand(-1, C, -1, -1)                       # [B, C, C, D]
+        idx_expand = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)             # [B, C, K, D]
+        neigh = torch.gather(h_expand, dim=2, index=idx_expand)               # [B, C, K, D]
 
-        # Safety: avoid NaN / Inf entering softmax.
-        topk_scores = torch.nan_to_num(
-            topk_scores,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-
-        # Gather neighbors.
-        h_expand = h.unsqueeze(1).expand(-1, C, -1, -1)            # [B, C, C, D]
-        idx_expand = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)  # [B, C, K, D]
-        neigh = torch.gather(h_expand, dim=2, index=idx_expand)    # [B, C, K, D]
-
-        # Project neighbor features.
-        neigh = self.v_proj(neigh)                                 # [B, C, K, D]
-
-        # Conservative aggregation:
-        # use absolute score as dependency strength only.
-        attn = torch.softmax(topk_scores.abs(), dim=-1).unsqueeze(-1)  # [B, C, K, 1]
+        # attention within filtered candidate set
+        attn = torch.softmax(topk_scores, dim=-1).unsqueeze(-1)               # [B, C, K, 1]
         attn = self.dropout(attn)
 
-        agg = (attn * neigh).sum(dim=2)                            # [B, C, D]
+        neigh = self.v_proj(neigh)                                             # [B, C, K, D]
+        agg = (attn * neigh).sum(dim=2)                                        # [B, C, D]
 
-        # Feature-wise gated residual message.
-        gate = torch.sigmoid(self.gate_proj(torch.cat([h, agg], dim=-1)))
+        gate = torch.sigmoid(self.gate_proj(torch.cat([h, agg], dim=-1)))     # [B, C, D]
         delta = gate * self.out_proj(agg)
-
-        # Final safety.
-        delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
-
+        
         return delta
