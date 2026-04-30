@@ -36,6 +36,7 @@ do
     --ma_type $ma_type \
     --alpha $alpha \
     --use_trend_interactor 1 \
+    --use_seasonal_interactor 1 \
     --topk 2 \
     --interactor_dropout 0.0\
     --beta $beta > logs/$ma_type/$model_name'_ETTh1_'$seq_len'_'$pred_len.log
