@@ -4,9 +4,9 @@ import torch.nn as nn
 
 class SeasonalAdaptiveVariableMixer(nn.Module):
     """
-    Seasonal / residual stream variable modeling for xPatch.
+    Variable-aware seasonal / residual feature calibration for xPatch.
 
-    This module is designed for seasonal patch representations.
+    This module is designed for xPatch's seasonal / residual patch stream.
 
     Input:
         x: [B, C, P, D]
@@ -20,8 +20,19 @@ class SeasonalAdaptiveVariableMixer(nn.Module):
 
     Main idea:
         1. Learn an adaptive sparse variable graph.
-        2. Aggregate neighboring variable representations at each patch position.
-        3. Use a gated fusion mechanism to control how much neighbor information is injected.
+        2. Use neighboring variables only to produce a gate.
+        3. Calibrate the current variable's own seasonal / residual feature.
+        4. Avoid directly injecting neighbor features into the seasonal stream.
+
+    Difference from direct variable mixing:
+        Direct mixing:
+            delta_i = gate_i * neighbor_i
+
+        This module:
+            delta_i = gate_i * self_i
+
+    This is more conservative and is usually safer for high-frequency
+    seasonal / residual features, especially for long-horizon forecasting.
     """
 
     def __init__(
@@ -33,24 +44,30 @@ class SeasonalAdaptiveVariableMixer(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+
         self.c_in = c_in
         self.topk = topk
 
-        # Adaptive variable graph, inspired by adaptive adjacency learning.
+        # Adaptive variable graph.
+        # adj[i, j] means variable j contributes to the gate of variable i.
         self.node_emb1 = nn.Parameter(torch.randn(c_in, node_dim))
         self.node_emb2 = nn.Parameter(torch.randn(node_dim, c_in))
 
-        # Stabilize seasonal / residual patch features.
+        # Normalize patch features along hidden dimension.
         self.norm = nn.LayerNorm(d_model)
 
-        # Neighbor value projection.
-        self.value_proj = nn.Linear(d_model, d_model)
+        # Neighbor feature projection used only for gate generation.
+        self.neigh_proj = nn.Linear(d_model, d_model)
 
-        # Gated fusion. The gate is patch-wise, variable-wise, and feature-wise.
+        # Self feature projection before calibration.
+        self.self_proj = nn.Linear(d_model, d_model)
+
+        # Gate generation from [self feature, neighbor summary].
         self.gate_proj = nn.Linear(d_model * 2, d_model)
 
         # Output projection.
         self.out_proj = nn.Linear(d_model, d_model)
+
         self.dropout = nn.Dropout(dropout)
 
     def build_adj(self):
@@ -64,11 +81,11 @@ class SeasonalAdaptiveVariableMixer(nn.Module):
         """
         adj = torch.relu(torch.tanh(self.node_emb1 @ self.node_emb2))  # [C, C]
 
-        # Remove self-loop. The residual path already preserves self information.
+        # Remove self-loop. Self information is preserved by the residual path.
         eye = torch.eye(self.c_in, device=adj.device, dtype=torch.bool)
         adj = adj.masked_fill(eye, 0.0)
 
-        # Sparse top-k neighbor selection.
+        # Sparse top-k variable selection.
         if self.topk is not None and self.topk > 0:
             k = min(self.topk, max(self.c_in - 1, 1))
             idx = torch.topk(adj, k=k, dim=-1).indices  # [C, k]
@@ -89,18 +106,27 @@ class SeasonalAdaptiveVariableMixer(nn.Module):
         Returns:
             delta: [B, C, P, D]
         """
-        z = self.norm(x)
+        # Stabilize seasonal / residual patch features.
+        z = self.norm(x)  # [B, C, P, D]
 
+        # Build adaptive variable graph.
         adj = self.build_adj()  # [C, C]
 
-        # Aggregate neighbor variables for each patch position.
-        # adj[i, j] means variable j contributes to variable i.
+        # Neighbor summary for each variable and each patch.
+        # Important: this neighbor summary is only used to generate gates.
         neigh = torch.einsum("ij,bjpd->bipd", adj, z)  # [B, C, P, D]
-        neigh = self.value_proj(neigh)
+        neigh = self.neigh_proj(neigh)
 
-        # Gated fusion.
+        # Self feature to be calibrated.
+        self_feat = self.self_proj(z)
+
+        # Variable-aware gate.
         gate = torch.sigmoid(self.gate_proj(torch.cat([z, neigh], dim=-1)))
-        delta = gate * neigh
+
+        # Conservative calibration:
+        # use neighbor information only to decide the gate,
+        # but do not directly inject neighbor features.
+        delta = gate * self_feat
 
         delta = self.out_proj(delta)
         delta = self.dropout(delta)
