@@ -49,7 +49,7 @@ class Network(nn.Module):
         self.gelu1 = nn.GELU()
         self.bn1 = nn.BatchNorm1d(self.patch_num)
 
-        # Seasonal variable dependency modeling.
+        # Seasonal / residual variable-aware calibration.
         # Inserted after patch embedding and before depthwise conv.
         if self.use_seasonal_interactor:
             self.seasonal_interactor = SeasonalAdaptiveVariableMixer(
@@ -59,8 +59,10 @@ class Network(nn.Module):
                 topk=self.topk,
                 dropout=interactor_dropout,
             )
+
             # Zero-initialized residual gate.
-            # At the beginning, the model is almost identical to original xPatch.
+            # The effective scale is 0.1 * tanh(seasonal_scale),
+            # so the maximum absolute injection strength is limited to 0.1.
             self.seasonal_scale = nn.Parameter(torch.zeros(1))
 
         # CNN Depthwise
@@ -78,7 +80,12 @@ class Network(nn.Module):
         self.fc2 = nn.Linear(self.dim, patch_len)
 
         # CNN Pointwise
-        self.conv2 = nn.Conv1d(self.patch_num, self.patch_num, kernel_size=1, stride=1)
+        self.conv2 = nn.Conv1d(
+            self.patch_num,
+            self.patch_num,
+            kernel_size=1,
+            stride=1,
+        )
         self.gelu3 = nn.GELU()
         self.bn3 = nn.BatchNorm1d(self.patch_num)
 
@@ -90,7 +97,6 @@ class Network(nn.Module):
 
         # =========================
         # Linear Trend Stream
-        # Keep original xPatch trend encoder.
         # =========================
         self.fc5 = nn.Linear(seq_len, pred_len * 4)
         self.avgpool1 = nn.AvgPool1d(kernel_size=2)
@@ -105,10 +111,7 @@ class Network(nn.Module):
 
         # =========================
         # Trend Variable Interaction
-        # Current version keeps your previous modules.
-        # If you are using the "moved position" version locally,
-        # you can place this block before fc7 with d_model=pred_len//2.
-        # Here I keep the original prediction-level setting for compatibility.
+        # Keep your previous trend branch module.
         # =========================
         if self.use_trend_interactor:
             self.variable_filter = VariableFilter(
@@ -123,6 +126,8 @@ class Network(nn.Module):
                 d_model=self.pred_len,
                 dropout=interactor_dropout,
             )
+
+            # Safer than fixed 0.1 correction.
             self.trend_scale = nn.Parameter(torch.zeros(1))
 
         # =========================
@@ -147,7 +152,11 @@ class Network(nn.Module):
         if self.padding_patch == "end":
             s = self.padding_patch_layer(s)
 
-        s = s.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        s = s.unfold(
+            dimension=-1,
+            size=self.patch_len,
+            step=self.stride,
+        )
         # [B*C, patch_num, patch_len]
 
         # Patch embedding
@@ -157,12 +166,17 @@ class Network(nn.Module):
         # [B*C, patch_num, dim]
 
         # =========================
-        # Seasonal variable dependency modeling
+        # Seasonal / residual variable-aware calibration
         # =========================
         if self.use_seasonal_interactor:
             s_4d = s.reshape(B, C, self.patch_num, self.dim)
             delta_s = self.seasonal_interactor(s_4d)
-            s_4d = s_4d + torch.tanh(self.seasonal_scale) * delta_s
+
+            # Conservative injection:
+            # limit the maximum effective residual strength to 0.1.
+            seasonal_scale = 0.1 * torch.tanh(self.seasonal_scale)
+            s_4d = s_4d + seasonal_scale * delta_s
+
             s = s_4d.reshape(B * C, self.patch_num, self.dim)
 
         res = s
@@ -188,6 +202,7 @@ class Network(nn.Module):
         s = self.fc4(s)
 
         s = torch.reshape(s, (B, C, self.pred_len))  # [B, C, pred_len]
+
         return s
 
     def _trend_stream(self, t):
@@ -216,25 +231,26 @@ class Network(nn.Module):
         if self.use_trend_interactor:
             topk_idx, topk_scores, _ = self.variable_filter(t_raw, t)
             delta_t = self.trend_interactor(t, topk_idx, topk_scores)
-            t = t + torch.tanh(self.trend_scale) * delta_t
+
+            trend_scale = torch.tanh(self.trend_scale)
+            t = t + trend_scale * delta_t
 
         return t
 
     def forward(self, s, t):
         """
         Args:
-            s: seasonality / residual input, [B, L, C]
+            s: seasonal / residual input, [B, L, C]
             t: trend input, [B, L, C]
 
         Returns:
             x: [B, pred_len, C]
         """
-
         # To [B, C, L]
         s = s.permute(0, 2, 1)
         t = t.permute(0, 2, 1)
 
-        # Seasonal stream
+        # Seasonal / residual stream
         s_out = self._seasonal_stream(s)  # [B, C, pred_len]
 
         # Trend stream
