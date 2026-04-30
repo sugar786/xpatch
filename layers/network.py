@@ -3,21 +3,36 @@ from torch import nn
 
 from layers.variable_filter import VariableFilter
 from layers.sparse_trend_interactor import SparseTrendInteractor
+from layers.seasonal_adaptive_variable_mixer import SeasonalAdaptiveVariableMixer
 
 
 class Network(nn.Module):
-    def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch,
-                 use_trend_interactor=False, topk=4, interactor_dropout=0.0):
+    def __init__(
+        self,
+        seq_len,
+        pred_len,
+        patch_len,
+        stride,
+        padding_patch,
+        c_in,
+        use_trend_interactor=False,
+        use_seasonal_interactor=False,
+        topk=4,
+        interactor_dropout=0.0,
+    ):
         super(Network, self).__init__()
 
         # Parameters
         self.pred_len = pred_len
         self.seq_len = seq_len
+        self.c_in = c_in
+
         self.use_trend_interactor = use_trend_interactor
+        self.use_seasonal_interactor = use_seasonal_interactor
         self.topk = topk
 
         # =========================
-        # Non-linear Stream (Seasonal)
+        # Non-linear Stream (Seasonal / Residual)
         # =========================
         self.patch_len = patch_len
         self.stride = stride
@@ -25,7 +40,7 @@ class Network(nn.Module):
         self.dim = patch_len * patch_len
         self.patch_num = (seq_len - patch_len) // stride + 1
 
-        if padding_patch == 'end':
+        if padding_patch == "end":
             self.padding_patch_layer = nn.ReplicationPad1d((0, stride))
             self.patch_num += 1
 
@@ -34,13 +49,27 @@ class Network(nn.Module):
         self.gelu1 = nn.GELU()
         self.bn1 = nn.BatchNorm1d(self.patch_num)
 
+        # Seasonal variable dependency modeling.
+        # Inserted after patch embedding and before depthwise conv.
+        if self.use_seasonal_interactor:
+            self.seasonal_interactor = SeasonalAdaptiveVariableMixer(
+                c_in=c_in,
+                d_model=self.dim,
+                node_dim=16,
+                topk=self.topk,
+                dropout=interactor_dropout,
+            )
+            # Zero-initialized residual gate.
+            # At the beginning, the model is almost identical to original xPatch.
+            self.seasonal_scale = nn.Parameter(torch.zeros(1))
+
         # CNN Depthwise
         self.conv1 = nn.Conv1d(
             self.patch_num,
             self.patch_num,
             kernel_size=patch_len,
             stride=patch_len,
-            groups=self.patch_num
+            groups=self.patch_num,
         )
         self.gelu2 = nn.GELU()
         self.bn2 = nn.BatchNorm1d(self.patch_num)
@@ -61,7 +90,7 @@ class Network(nn.Module):
 
         # =========================
         # Linear Trend Stream
-        # keep original xPatch trend encoder intact
+        # Keep original xPatch trend encoder.
         # =========================
         self.fc5 = nn.Linear(seq_len, pred_len * 4)
         self.avgpool1 = nn.AvgPool1d(kernel_size=2)
@@ -71,26 +100,30 @@ class Network(nn.Module):
         self.avgpool2 = nn.AvgPool1d(kernel_size=2)
         self.ln2 = nn.LayerNorm(pred_len // 2)
 
-        # original trend prediction head
+        # Original trend prediction head
         self.fc7 = nn.Linear(pred_len // 2, pred_len)
 
         # =========================
-        # Prediction-level Trend Correction
+        # Trend Variable Interaction
+        # Current version keeps your previous modules.
+        # If you are using the "moved position" version locally,
+        # you can place this block before fc7 with d_model=pred_len//2.
+        # Here I keep the original prediction-level setting for compatibility.
         # =========================
         if self.use_trend_interactor:
-            # now we filter with raw trend + predicted trend
             self.variable_filter = VariableFilter(
                 d_model=self.pred_len,
                 topk=self.topk,
                 dropout=interactor_dropout,
                 learnable_weight=0.1,
                 use_lag_corr=True,
-                max_lag=3
+                max_lag=3,
             )
             self.trend_interactor = SparseTrendInteractor(
                 d_model=self.pred_len,
-                dropout=interactor_dropout
+                dropout=interactor_dropout,
             )
+            self.trend_scale = nn.Parameter(torch.zeros(1))
 
         # =========================
         # Streams Concatenation
@@ -99,42 +132,56 @@ class Network(nn.Module):
 
     def _seasonal_stream(self, s):
         """
-        s: [B, C, L]
-        return: [B, C, pred_len]
+        Args:
+            s: [B, C, L]
+
+        Returns:
+            s: [B, C, pred_len]
         """
         B, C, I = s.shape
 
-        # channel split for channel independence
+        # Channel split for channel independence.
         s = torch.reshape(s, (B * C, I))  # [B*C, L]
 
-        # patching
-        if self.padding_patch == 'end':
+        # Patching
+        if self.padding_patch == "end":
             s = self.padding_patch_layer(s)
+
         s = s.unfold(dimension=-1, size=self.patch_len, step=self.stride)
         # [B*C, patch_num, patch_len]
 
-        # patch embedding
+        # Patch embedding
         s = self.fc1(s)
         s = self.gelu1(s)
         s = self.bn1(s)
+        # [B*C, patch_num, dim]
+
+        # =========================
+        # Seasonal variable dependency modeling
+        # =========================
+        if self.use_seasonal_interactor:
+            s_4d = s.reshape(B, C, self.patch_num, self.dim)
+            delta_s = self.seasonal_interactor(s_4d)
+            s_4d = s_4d + torch.tanh(self.seasonal_scale) * delta_s
+            s = s_4d.reshape(B * C, self.patch_num, self.dim)
 
         res = s
 
-        # depthwise conv
+        # Depthwise conv
         s = self.conv1(s)
         s = self.gelu2(s)
         s = self.bn2(s)
 
-        # residual stream
+        # Residual stream
         res = self.fc2(res)
         s = s + res
 
-        # pointwise conv
+        # Pointwise conv
         s = self.conv2(s)
         s = self.gelu3(s)
         s = self.bn3(s)
 
-        # flatten head
+        # Flatten head
         s = self.flatten1(s)
         s = self.fc3(s)
         s = self.gelu4(s)
@@ -145,14 +192,15 @@ class Network(nn.Module):
 
     def _trend_stream(self, t):
         """
-        t: [B, C, L]
-        return: [B, C, pred_len]
-        """
-        t_raw = t  # keep raw trend for statistical filtering
+        Args:
+            t: [B, C, L]
 
-        # -------------------------
-        # original xPatch trend encoder
-        # -------------------------
+        Returns:
+            t: [B, C, pred_len]
+        """
+        t_raw = t
+
+        # Original xPatch trend encoder
         t = self.fc5(t)           # [B, C, pred_len*4]
         t = self.avgpool1(t)      # [B, C, pred_len*2]
         t = self.ln1(t)
@@ -161,38 +209,42 @@ class Network(nn.Module):
         t = self.avgpool2(t)      # [B, C, pred_len//2]
         t = self.ln2(t)
 
-        # original trend prediction
+        # Original trend prediction
         t = self.fc7(t)           # [B, C, pred_len]
 
-        # -------------------------
-        # prediction-level sparse correction
-        # -------------------------
+        # Trend variable correction
         if self.use_trend_interactor:
             topk_idx, topk_scores, _ = self.variable_filter(t_raw, t)
             delta_t = self.trend_interactor(t, topk_idx, topk_scores)
-            t = t + 0.1 * delta_t
+            t = t + torch.tanh(self.trend_scale) * delta_t
 
         return t
 
     def forward(self, s, t):
-        # s - seasonality: [B, L, C]
-        # t - trend:       [B, L, C]
+        """
+        Args:
+            s: seasonality / residual input, [B, L, C]
+            t: trend input, [B, L, C]
 
-        # to [B, C, L]
+        Returns:
+            x: [B, pred_len, C]
+        """
+
+        # To [B, C, L]
         s = s.permute(0, 2, 1)
         t = t.permute(0, 2, 1)
 
-        # seasonal stream
-        s_out = self._seasonal_stream(s)   # [B, C, pred_len]
+        # Seasonal stream
+        s_out = self._seasonal_stream(s)  # [B, C, pred_len]
 
-        # trend stream
-        t_out = self._trend_stream(t)      # [B, C, pred_len]
+        # Trend stream
+        t_out = self._trend_stream(t)     # [B, C, pred_len]
 
-        # streams concatenation
+        # Streams concatenation
         x = torch.cat((s_out, t_out), dim=-1)  # [B, C, pred_len*2]
         x = self.fc8(x)                        # [B, C, pred_len]
 
-        # back to [B, pred_len, C]
+        # Back to [B, pred_len, C]
         x = x.permute(0, 2, 1)
 
         return x
