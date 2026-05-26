@@ -104,6 +104,8 @@ class Model(nn.Module):
             x = self.net(seasonal_init, trend_init, x_raw=x_raw)
 
         # Optional CCM cluster loss
+        raw_cluster_loss = None
+        
         if (
             self.use_ccm_head
             and self.ccm_loss_fn is not None
@@ -114,9 +116,13 @@ class Model(nn.Module):
                 self.net.ccm_sim_matrix,
                 self.net.ccm_membership,
             )
-
+        
         self.raw_cluster_loss = raw_cluster_loss
-        self.aux_loss = self.ccm_loss_weight * raw_cluster_loss
+        
+        if raw_cluster_loss is None:
+            self.aux_loss = None
+        else:
+            self.aux_loss = self.ccm_loss_weight * raw_cluster_loss
 
         # RevIN denormalization
         if self.revin:
