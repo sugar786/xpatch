@@ -34,7 +34,7 @@ parser.add_argument('--freq', type=str, default='h',
                     help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
 parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
 parser.add_argument('--embed', type=str, default='timeF',
-                        help='time features encoding, options:[timeF, fixed, learned]')
+                    help='time features encoding, options:[timeF, fixed, learned]')
 
 # forecasting task
 parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
@@ -64,7 +64,7 @@ parser.add_argument('--loss', type=str, default='mse', help='loss function')
 parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
 parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 parser.add_argument('--revin', type=int, default=1, help='RevIN; True 1 False 0')
-# parser.add_argument('--warmup_epochs',type=int,default = 0)
+# parser.add_argument('--warmup_epochs', type=int, default=0)
 
 # GPU
 parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
@@ -73,10 +73,60 @@ parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple g
 parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
 parser.add_argument('--test_flop', action='store_true', default=False, help='See utils/tools for usage')
 
-parser.add_argument('--use_trend_interactor', type=int, default=0, help='use sparse trend variable interaction')
-parser.add_argument('--topk', type=int, default=4, help='top-k candidate variables for each target variable')
-parser.add_argument('--interactor_dropout', type=float, default=0.0, help='dropout for trend interactor')
+# =========================
+# CCM-xPatch Head config
+# =========================
+parser.add_argument('--use_ccm_head', type=int, default=0,
+                    help='whether to use CCM-style cluster-aware prediction head')
+
+parser.add_argument('--ccm_head_type', type=str, default='seasonal',
+                    choices=['seasonal', 'trend', 'both'],
+                    help='where to use CCM-aware head: seasonal, trend, or both')
+
+parser.add_argument('--n_cluster', type=int, default=2,
+                    help='number of CCM clusters')
+
+parser.add_argument('--ccm_d_model', type=int, default=32,
+                    help='hidden dimension of CCM channel embedding')
+
+parser.add_argument('--ccm_sigma', type=float, default=5.0,
+                    help='sigma for RBF channel similarity in CCM loss')
+
+parser.add_argument('--ccm_epsilon', type=float, default=0.2,
+                    help='temperature/epsilon for cluster probability')
+
+parser.add_argument('--ccm_gumbel_temp', type=float, default=0.5,
+                    help='temperature for differentiable Bernoulli membership')
+
+parser.add_argument('--ccm_use_gumbel', type=int, default=0,
+                    help='whether to use Gumbel-Sigmoid membership during training')
+
+parser.add_argument('--ccm_dropout', type=float, default=0.0,
+                    help='dropout for CCM module')
+
+parser.add_argument('--ccm_loss_weight', type=float, default=0.001,
+                    help='weight for CCM cluster loss; 0 means disabled')
+
+parser.add_argument('--ccm_residual_weight', type=float, default=0.5,
+                    help='residual mixing weight for CCM head')
+
+parser.add_argument('--train_loss_type', type=str, default='mae',
+                    choices=['mae', 'mse'],
+                    help='training forecasting loss type')
+
+parser.add_argument('--vali_loss_type', type=str, default='mae',
+                    choices=['mae', 'mse'],
+                    help='validation loss type for early stopping')
+
+parser.add_argument('--use_loss_ratio', type=int, default=1,
+                    help='whether to use original xPatch horizon weighted loss ratio')
+                    
 args = parser.parse_args()
+
+args.use_ccm_head = bool(args.use_ccm_head)
+args.ccm_use_gumbel = bool(args.ccm_use_gumbel)
+args.use_loss_ratio = bool(args.use_loss_ratio)
+
 
 args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
