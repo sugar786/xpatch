@@ -35,10 +35,20 @@ do
     --lradj 'sigmoid'\
     --ma_type $ma_type \
     --alpha $alpha \
-    --use_trend_interactor 1 \
-    --use_seasonal_interactor 1 \
-    --topk 2 \
-    --interactor_dropout 0.0\
+    --use_ccm_head 1 \
+    --ccm_head_type seasonal \
+    --n_cluster 2 \
+    --ccm_d_model 128 \
+    --ccm_sigma 1.0 \
+    --ccm_epsilon 0.3 \
+    --ccm_gumbel_temp 0.5 \
+    --ccm_use_gumbel 1 \
+    --ccm_dropout 0.0 \
+    --ccm_loss_weight 0.01 \
+    --ccm_residual_weight 1.0 \
+    --train_loss_type mae \
+    --vali_loss_type mae \
+    --use_loss_ratio 1 \
     --beta $beta > logs/$ma_type/$model_name'_ETTh1_'$seq_len'_'$pred_len.log
 done
 done
