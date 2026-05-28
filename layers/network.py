@@ -22,22 +22,27 @@ class Network(nn.Module):
         ccm_use_gumbel=False,
         ccm_dropout=0.0,
         ccm_residual_weight=0.5,
+        ccm_trend_residual_weight=0.3,
+        ccm_use_prototype=True,
+        ccm_prob_mode="learned",
+        use_dual_ccm=False,
     ):
         super(Network, self).__init__()
 
-        # Parameters
         self.pred_len = pred_len
         self.seq_len = seq_len
 
         self.use_ccm_head = use_ccm_head
         self.ccm_head_type = ccm_head_type
         self.ccm_residual_weight = ccm_residual_weight
+        self.ccm_trend_residual_weight = ccm_trend_residual_weight
+        self.use_dual_ccm = use_dual_ccm
 
         assert self.ccm_head_type in ["seasonal", "trend", "both"], \
             "ccm_head_type must be one of ['seasonal', 'trend', 'both']"
 
         # =========================
-        # Non-linear Stream (Seasonal)
+        # Non-linear Stream, Seasonal
         # =========================
         self.patch_len = patch_len
         self.stride = stride
@@ -98,19 +103,51 @@ class Network(nn.Module):
         self.fc7 = nn.Linear(pred_len // 2, pred_len)
 
         # =========================
-        # CCM pre-temporal cluster assigner
+        # CCM assigners and heads
         # =========================
         if self.use_ccm_head:
-            self.cluster_assigner = CCMClusterAssigner(
-                seq_len=seq_len,
-                n_cluster=n_cluster,
-                d_model=ccm_d_model,
-                sigma=ccm_sigma,
-                epsilon=ccm_epsilon,
-                gumbel_temp=ccm_gumbel_temp,
-                use_gumbel=ccm_use_gumbel,
-                dropout=ccm_dropout,
-            )
+            if self.use_dual_ccm:
+                if self.ccm_head_type in ["seasonal", "both"]:
+                    self.seasonal_cluster_assigner = CCMClusterAssigner(
+                        seq_len=seq_len,
+                        n_cluster=n_cluster,
+                        d_model=ccm_d_model,
+                        sigma=ccm_sigma,
+                        epsilon=ccm_epsilon,
+                        gumbel_temp=ccm_gumbel_temp,
+                        use_gumbel=ccm_use_gumbel,
+                        dropout=ccm_dropout,
+                        use_prototype=ccm_use_prototype,
+                        prob_mode=ccm_prob_mode,
+                    )
+
+                if self.ccm_head_type in ["trend", "both"]:
+                    self.trend_cluster_assigner = CCMClusterAssigner(
+                        seq_len=seq_len,
+                        n_cluster=n_cluster,
+                        d_model=ccm_d_model,
+                        sigma=ccm_sigma,
+                        epsilon=ccm_epsilon,
+                        gumbel_temp=ccm_gumbel_temp,
+                        use_gumbel=ccm_use_gumbel,
+                        dropout=ccm_dropout,
+                        use_prototype=ccm_use_prototype,
+                        prob_mode=ccm_prob_mode,
+                    )
+            else:
+                # backward-compatible single CCM
+                self.cluster_assigner = CCMClusterAssigner(
+                    seq_len=seq_len,
+                    n_cluster=n_cluster,
+                    d_model=ccm_d_model,
+                    sigma=ccm_sigma,
+                    epsilon=ccm_epsilon,
+                    gumbel_temp=ccm_gumbel_temp,
+                    use_gumbel=ccm_use_gumbel,
+                    dropout=ccm_dropout,
+                    use_prototype=ccm_use_prototype,
+                    prob_mode=ccm_prob_mode,
+                )
 
             if self.ccm_head_type in ["seasonal", "both"]:
                 self.ccm_seasonal_head = ClusterAwareSeasonalHead(
@@ -133,10 +170,44 @@ class Network(nn.Module):
         # =========================
         self.fc8 = nn.Linear(pred_len * 2, pred_len)
 
-        # Store CCM outputs for optional loss/debug.
+        # Backward-compatible single CCM cache.
         self.ccm_prob = None
         self.ccm_membership = None
         self.ccm_sim_matrix = None
+        self.ccm_channel_emb = None
+        self.ccm_cluster_emb = None
+
+        # Dual CCM cache.
+        self.ccm_prob_s = None
+        self.ccm_membership_s = None
+        self.ccm_sim_matrix_s = None
+        self.ccm_channel_emb_s = None
+        self.ccm_cluster_emb_s = None
+
+        self.ccm_prob_t = None
+        self.ccm_membership_t = None
+        self.ccm_sim_matrix_t = None
+        self.ccm_channel_emb_t = None
+        self.ccm_cluster_emb_t = None
+
+    def _reset_ccm_cache(self):
+        self.ccm_prob = None
+        self.ccm_membership = None
+        self.ccm_sim_matrix = None
+        self.ccm_channel_emb = None
+        self.ccm_cluster_emb = None
+
+        self.ccm_prob_s = None
+        self.ccm_membership_s = None
+        self.ccm_sim_matrix_s = None
+        self.ccm_channel_emb_s = None
+        self.ccm_cluster_emb_s = None
+
+        self.ccm_prob_t = None
+        self.ccm_membership_t = None
+        self.ccm_sim_matrix_t = None
+        self.ccm_channel_emb_t = None
+        self.ccm_cluster_emb_t = None
 
     def _seasonal_backbone(self, s):
         """
@@ -148,39 +219,31 @@ class Network(nn.Module):
         """
         B, C, I = s.shape
 
-        # Channel-independent seasonal modeling
         s = torch.reshape(s, (B * C, I))  # [B*C, L]
 
-        # Patching
         if self.padding_patch == 'end':
             s = self.padding_patch_layer(s)
 
         s = s.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        # [B*C, patch_num, patch_len]
 
-        # Patch embedding
         s = self.fc1(s)
         s = self.gelu1(s)
         s = self.bn1(s)
 
         res = s
 
-        # Depthwise convolution
         s = self.conv1(s)
         s = self.gelu2(s)
         s = self.bn2(s)
 
-        # Residual stream
         res = self.fc2(res)
         s = s + res
 
-        # Pointwise convolution
         s = self.conv2(s)
         s = self.gelu3(s)
         s = self.bn3(s)
 
-        # Flatten feature
-        s = self.flatten1(s)  # [B*C, patch_num * patch_len]
+        s = self.flatten1(s)
         s = torch.reshape(s, (B, C, self.patch_num * self.patch_len))
 
         return s
@@ -237,55 +300,121 @@ class Network(nn.Module):
         """
         hidden = self._trend_backbone(t)
 
+        t_base = self.fc7(hidden)
+
         if self.use_ccm_head and self.ccm_head_type in ["trend", "both"]:
-            t_out = self.ccm_trend_head(hidden, prob)
+            t_ccm = self.ccm_trend_head(hidden, prob)
+            t_out = t_base + self.ccm_trend_residual_weight * (t_ccm - t_base)
         else:
-            t_out = self.fc7(hidden)
+            t_out = t_base
 
         return t_out
+
+    def _compute_single_ccm_prob(self, x_raw):
+        """
+        Backward-compatible single CCM mode.
+
+        Args:
+            x_raw: [B, L, C]
+
+        Returns:
+            prob_for_head: [B, C, K]
+        """
+        prob, membership, sim_matrix, channel_emb, cluster_emb = self.cluster_assigner(x_raw)
+
+        self.ccm_prob = prob
+        self.ccm_membership = membership
+        self.ccm_sim_matrix = sim_matrix
+        self.ccm_channel_emb = channel_emb
+        self.ccm_cluster_emb = cluster_emb
+
+        # Stabilize cluster identity for fixed-channel datasets.
+        prob_for_head = prob.mean(dim=0, keepdim=True).expand_as(prob)
+
+        return prob_for_head
+
+    def _compute_dual_ccm_prob(self, seasonal_raw, trend_raw):
+        """
+        Dual CCM mode.
+
+        Args:
+            seasonal_raw: seasonal_init, [B, L, C]
+            trend_raw: trend_init, [B, L, C]
+
+        Returns:
+            prob_s_for_head: [B, C, K]
+            prob_t_for_head: [B, C, K]
+        """
+        prob_s = None
+        prob_t = None
+
+        if self.ccm_head_type in ["seasonal", "both"]:
+            prob_s, membership_s, sim_matrix_s, channel_emb_s, cluster_emb_s = \
+                self.seasonal_cluster_assigner(seasonal_raw)
+
+            self.ccm_prob_s = prob_s
+            self.ccm_membership_s = membership_s
+            self.ccm_sim_matrix_s = sim_matrix_s
+            self.ccm_channel_emb_s = channel_emb_s
+            self.ccm_cluster_emb_s = cluster_emb_s
+
+            prob_s = prob_s.mean(dim=0, keepdim=True).expand_as(prob_s)
+
+        if self.ccm_head_type in ["trend", "both"]:
+            prob_t, membership_t, sim_matrix_t, channel_emb_t, cluster_emb_t = \
+                self.trend_cluster_assigner(trend_raw)
+
+            self.ccm_prob_t = prob_t
+            self.ccm_membership_t = membership_t
+            self.ccm_sim_matrix_t = sim_matrix_t
+            self.ccm_channel_emb_t = channel_emb_t
+            self.ccm_cluster_emb_t = cluster_emb_t
+
+            prob_t = prob_t.mean(dim=0, keepdim=True).expand_as(prob_t)
+
+        return prob_s, prob_t
 
     def forward(self, s, t, x_raw=None):
         """
         Args:
             s: seasonality input, [B, L, C]
             t: trend input,       [B, L, C]
-            x_raw: normalized raw input for CCM clustering, [B, L, C]
+            x_raw: input for single CCM mode, [B, L, C]
 
         Returns:
             x: prediction, [B, pred_len, C]
         """
 
-        # reset cached CCM tensors
-        self.ccm_prob = None
-        self.ccm_membership = None
-        self.ccm_sim_matrix = None
+        self._reset_ccm_cache()
 
         if x_raw is None:
             x_raw = s + t
 
-        prob = None
+        prob_s_for_head = None
+        prob_t_for_head = None
 
-        # CCM cluster assignment is computed before temporal modules.
         if self.use_ccm_head:
-            prob, membership, sim_matrix, _, _ = self.cluster_assigner(x_raw)
-
-            # Cache original probability for diagnosis.
-            self.ccm_prob = prob
-            self.ccm_membership = membership
-            self.ccm_sim_matrix = sim_matrix
-
-            # Stabilize cluster identity for fixed-channel multivariate datasets.
-            prob_for_head = prob.mean(dim=0, keepdim=True).expand_as(prob)
-        else:
-            prob_for_head = None
+            if self.use_dual_ccm:
+                # Dual-CCM:
+                # seasonal_init -> P_s -> seasonal head
+                # trend_init    -> P_t -> trend head
+                prob_s_for_head, prob_t_for_head = self._compute_dual_ccm_prob(
+                    seasonal_raw=s,
+                    trend_raw=t,
+                )
+            else:
+                # Single-CCM backward-compatible mode.
+                prob_for_head = self._compute_single_ccm_prob(x_raw)
+                prob_s_for_head = prob_for_head
+                prob_t_for_head = prob_for_head
 
         # [B, L, C] -> [B, C, L]
         s = s.permute(0, 2, 1)
         t = t.permute(0, 2, 1)
 
-        s_out = self._seasonal_stream(s, prob=prob_for_head)
-        t_out = self._trend_stream(t, prob=prob_for_head)
-        
+        s_out = self._seasonal_stream(s, prob=prob_s_for_head)
+        t_out = self._trend_stream(t, prob=prob_t_for_head)
+
         # Original xPatch fusion
         x = torch.cat((s_out, t_out), dim=-1)
         x = self.fc8(x)
