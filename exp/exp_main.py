@@ -3,6 +3,11 @@ from exp.exp_basic import Exp_Basic
 from models import xPatch
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
+from utils.ccm_diagnosis import (
+    ccm_diagnose_tensors,
+    save_ccm_visuals,
+    save_embedding_pca,
+)
 
 import numpy as np
 import torch
@@ -35,25 +40,23 @@ class Exp_Main(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        # model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         model_optim = optim.AdamW(self.model.parameters(), lr=self.args.learning_rate)
         return model_optim
 
-    # MSE and MAE criterion
     def _select_criterion(self):
         mse_criterion = nn.MSELoss()
         mae_criterion = nn.L1Loss()
         return mse_criterion, mae_criterion
 
     def _select_forecast_loss(self, mse_criterion, mae_criterion):
-            loss_type = getattr(self.args, "train_loss_type", "mae")
+        loss_type = getattr(self.args, "train_loss_type", "mae")
 
-            if loss_type == "mse":
-                return mse_criterion
-            elif loss_type == "mae":
-                return mae_criterion
-            else:
-                raise ValueError("Unsupported train_loss_type: {}".format(loss_type))
+        if loss_type == "mse":
+            return mse_criterion
+        elif loss_type == "mae":
+            return mae_criterion
+        else:
+            raise ValueError("Unsupported train_loss_type: {}".format(loss_type))
 
     def _select_vali_loss(self, mse_criterion, mae_criterion):
         loss_type = getattr(self.args, "vali_loss_type", "mae")
@@ -66,20 +69,9 @@ class Exp_Main(Exp_Basic):
             raise ValueError("Unsupported vali_loss_type: {}".format(loss_type))
 
     def _get_model_for_aux(self):
-        """
-        Return the actual model object when DataParallel is used.
-        """
         return self.model.module if hasattr(self.model, "module") else self.model
 
     def _get_aux_loss(self):
-        """
-        Optional auxiliary loss, e.g. CCM cluster loss.
-
-        The model can implement:
-            get_aux_loss()
-
-        If the model does not provide it, return 0.0.
-        """
         model_for_aux = self._get_model_for_aux()
 
         if not hasattr(model_for_aux, "get_aux_loss"):
@@ -93,7 +85,7 @@ class Exp_Main(Exp_Basic):
         return aux_loss
 
     def _get_raw_cluster_loss(self):
-        model_for_aux = self.model.module if hasattr(self.model, "module") else self.model
+        model_for_aux = self._get_model_for_aux()
 
         if not hasattr(model_for_aux, "get_raw_cluster_loss"):
             return 0.0
@@ -104,6 +96,203 @@ class Exp_Main(Exp_Basic):
             return 0.0
 
         return raw_loss
+
+    def _get_raw_cluster_loss_s(self):
+        model_for_aux = self._get_model_for_aux()
+
+        if not hasattr(model_for_aux, "get_raw_cluster_loss_s"):
+            return 0.0
+
+        raw_loss = model_for_aux.get_raw_cluster_loss_s()
+
+        if raw_loss is None:
+            return 0.0
+
+        return raw_loss
+
+    def _get_raw_cluster_loss_t(self):
+        model_for_aux = self._get_model_for_aux()
+
+        if not hasattr(model_for_aux, "get_raw_cluster_loss_t"):
+            return 0.0
+
+        raw_loss = model_for_aux.get_raw_cluster_loss_t()
+
+        if raw_loss is None:
+            return 0.0
+
+        return raw_loss
+
+    def _print_single_ccm_diag(self, name, S, prob, membership):
+        diag = ccm_diagnose_tensors(S, prob, membership)
+
+        print("[CCM Diagnose - {}]".format(name))
+        print("S offdiag mean/std/min/max: {:.6f} {:.6f} {:.6f} {:.6f}".format(
+            diag["S_off_mean"],
+            diag["S_off_std"],
+            diag["S_off_min"],
+            diag["S_off_max"],
+        ))
+        print("S-P alignment corr: {:.6f}".format(diag["S_P_alignment_corr"]))
+        print("P entropy: {:.6f}, normalized: {:.6f}".format(
+            diag["P_entropy"],
+            diag["P_entropy_norm"],
+        ))
+        print("P max mean: {:.6f}".format(diag["P_max_mean"]))
+        print("P usage:", diag["P_usage"])
+        print("P balance gap: {:.6f}".format(diag["P_balance_gap"]))
+        print("P dist mean/std: {:.6f} {:.6f}".format(
+            diag["P_dist_mean"],
+            diag["P_dist_std"],
+        ))
+
+        if "M_usage" in diag:
+            print("Membership usage:", diag["M_usage"])
+
+    def _save_single_ccm_visuals(
+        self,
+        S,
+        prob,
+        channel_emb,
+        cluster_emb,
+        path,
+        epoch,
+        name,
+    ):
+        save_dir = os.path.join(path, "ccm_visuals")
+        prefix = "{}_epoch_{:03d}".format(name, epoch + 1)
+
+        save_ccm_visuals(
+            S=S,
+            P=prob,
+            save_dir=save_dir,
+            prefix=prefix,
+        )
+
+        if (
+            getattr(self.args, "ccm_save_pca", 0)
+            and channel_emb is not None
+            and cluster_emb is not None
+        ):
+            save_embedding_pca(
+                channel_emb=channel_emb.detach(),
+                cluster_emb=cluster_emb.detach(),
+                save_dir=save_dir,
+                prefix=prefix,
+            )
+
+    def _maybe_diagnose_ccm(self, epoch, batch_idx, path, pred_loss, aux_loss):
+        """
+        Print and optionally save CCM diagnostics on the first batch of selected epochs.
+        Supports both single-CCM and dual-CCM.
+        """
+        diag_interval = getattr(self.args, "ccm_diag_interval", 5)
+        if diag_interval <= 0:
+            return
+
+        if batch_idx != 0:
+            return
+
+        if epoch % diag_interval != 0:
+            return
+
+        model_for_aux = self._get_model_for_aux()
+
+        if not hasattr(model_for_aux, "net"):
+            return
+
+        net = model_for_aux.net
+
+        print("\n[CCM Diagnose] epoch:", epoch + 1)
+
+        if getattr(self.args, "use_dual_ccm", 0):
+            # Seasonal CCM diagnosis
+            if (
+                hasattr(net, "ccm_prob_s") and net.ccm_prob_s is not None
+                and hasattr(net, "ccm_sim_matrix_s") and net.ccm_sim_matrix_s is not None
+            ):
+                prob_s = net.ccm_prob_s.detach()
+                S_s = net.ccm_sim_matrix_s.detach()
+                M_s = net.ccm_membership_s.detach() if net.ccm_membership_s is not None else None
+
+                self._print_single_ccm_diag("seasonal", S_s, prob_s, M_s)
+
+                if getattr(self.args, "ccm_save_visuals", 0):
+                    self._save_single_ccm_visuals(
+                        S=S_s,
+                        prob=prob_s,
+                        channel_emb=net.ccm_channel_emb_s,
+                        cluster_emb=net.ccm_cluster_emb_s,
+                        path=path,
+                        epoch=epoch,
+                        name="seasonal",
+                    )
+
+            # Trend CCM diagnosis
+            if (
+                hasattr(net, "ccm_prob_t") and net.ccm_prob_t is not None
+                and hasattr(net, "ccm_sim_matrix_t") and net.ccm_sim_matrix_t is not None
+            ):
+                prob_t = net.ccm_prob_t.detach()
+                S_t = net.ccm_sim_matrix_t.detach()
+                M_t = net.ccm_membership_t.detach() if net.ccm_membership_t is not None else None
+
+                self._print_single_ccm_diag("trend", S_t, prob_t, M_t)
+
+                if getattr(self.args, "ccm_save_visuals", 0):
+                    self._save_single_ccm_visuals(
+                        S=S_t,
+                        prob=prob_t,
+                        channel_emb=net.ccm_channel_emb_t,
+                        cluster_emb=net.ccm_cluster_emb_t,
+                        path=path,
+                        epoch=epoch,
+                        name="trend",
+                    )
+
+        else:
+            # Single CCM diagnosis
+            if (
+                hasattr(net, "ccm_prob") and net.ccm_prob is not None
+                and hasattr(net, "ccm_sim_matrix") and net.ccm_sim_matrix is not None
+            ):
+                prob = net.ccm_prob.detach()
+                S = net.ccm_sim_matrix.detach()
+                membership = net.ccm_membership.detach() if net.ccm_membership is not None else None
+
+                self._print_single_ccm_diag("single", S, prob, membership)
+
+                if getattr(self.args, "ccm_save_visuals", 0):
+                    self._save_single_ccm_visuals(
+                        S=S,
+                        prob=prob,
+                        channel_emb=net.ccm_channel_emb,
+                        cluster_emb=net.ccm_cluster_emb,
+                        path=path,
+                        epoch=epoch,
+                        name="single",
+                    )
+
+        if not isinstance(aux_loss, float):
+            aux_value = aux_loss.item()
+        else:
+            aux_value = 0.0
+
+        print("aux/pred ratio: {:.6f}".format(
+            aux_value / (pred_loss.item() + 1e-8)
+        ))
+
+        raw_s = self._get_raw_cluster_loss_s()
+        raw_t = self._get_raw_cluster_loss_t()
+
+        raw_s_value = raw_s.item() if not isinstance(raw_s, float) else 0.0
+        raw_t_value = raw_t.item() if not isinstance(raw_t, float) else 0.0
+
+        if getattr(self.args, "use_dual_ccm", 0):
+            print("raw_cluster_s: {:.7f} raw_cluster_t: {:.7f}".format(
+                raw_s_value,
+                raw_t_value,
+            ))
 
     def vali(self, vali_data, vali_loader, criterion, is_test=True):
         total_loss = []
@@ -117,21 +306,18 @@ class Exp_Main(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat(
                     [batch_y[:, :self.args.label_len, :], dec_inp],
                     dim=1
                 ).float().to(self.device)
 
-                # encoder - decoder
                 outputs = self.model(batch_x)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-                # if train-style validation, use ratio to scale the prediction
                 use_loss_ratio = getattr(self.args, "use_loss_ratio", True)
 
                 if (not is_test) and use_loss_ratio:
@@ -171,11 +357,9 @@ class Exp_Main(Exp_Basic):
         model_optim = self._select_optimizer()
         mse_criterion, mae_criterion = self._select_criterion()
 
-        # train_times = [] # For computational cost analysis
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
-            # train_time = 0 # For computational cost analysis
 
             self.model.train()
             epoch_time = time.time()
@@ -189,64 +373,18 @@ class Exp_Main(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat(
                     [batch_y[:, :self.args.label_len, :], dec_inp],
                     dim=1
                 ).float().to(self.device)
 
-                # encoder - decoder
-                # temp = time.time() # For computational cost analysis
                 outputs = self.model(batch_x)
-
-                model_for_aux = self.model.module if hasattr(self.model, "module") else self.model
-
-
-                if i == 0 and epoch % 5 == 0:
-                    if hasattr(model_for_aux, "net"):
-                        net = model_for_aux.net
-
-                        if hasattr(net, "ccm_prob") and net.ccm_prob is not None:
-                            prob = net.ccm_prob.detach()
-
-                            print("\n[CCM Diagnose] epoch:", epoch + 1)
-                            print("prob mean over batch [C, K]:")
-                            print(prob.mean(dim=0).cpu())
-
-                            print("prob std over batch [C, K]:")
-                            print(prob.std(dim=0).cpu())
-
-                            print("prob cluster usage mean [K]:")
-                            print(prob.mean(dim=(0, 1)).cpu())
-
-                            print("prob max mean:")
-                            print(prob.max(dim=-1).values.mean().item())
-
-                        if hasattr(net, "ccm_sim_matrix") and net.ccm_sim_matrix is not None:
-                            S = net.ccm_sim_matrix.detach()
-                            B, C, _ = S.shape
-
-                            eye = torch.eye(C, device=S.device, dtype=torch.bool).unsqueeze(0)
-                            off_diag = S.masked_select(~eye.expand(B, C, C))
-
-                            print("similarity S mean/std/min/max off-diag:")
-                            print(
-                                off_diag.mean().item(),
-                                off_diag.std().item(),
-                                off_diag.min().item(),
-                                off_diag.max().item()
-                            )
-
-                            print("similarity S mean matrix [C, C]:")
-                            print(S.mean(dim=0).cpu())
-                # train_time += time.time() - temp # For computational cost analysis
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-                # Arctangent loss with weight decay
                 forecast_criterion = self._select_forecast_loss(mse_criterion, mae_criterion)
                 use_loss_ratio = getattr(self.args, "use_loss_ratio", True)
 
@@ -263,15 +401,18 @@ class Exp_Main(Exp_Basic):
                     pred_for_loss = outputs
                     true_for_loss = batch_y
 
-                # Main forecasting loss
                 pred_loss = forecast_criterion(pred_for_loss, true_for_loss)
                 loss = pred_loss
 
                 aux_loss = self._get_aux_loss()
                 raw_cluster_loss = self._get_raw_cluster_loss()
+                raw_cluster_loss_s = self._get_raw_cluster_loss_s()
+                raw_cluster_loss_t = self._get_raw_cluster_loss_t()
 
                 aux_loss_value = 0.0
                 raw_cluster_loss_value = 0.0
+                raw_cluster_loss_s_value = 0.0
+                raw_cluster_loss_t_value = 0.0
 
                 if not isinstance(aux_loss, float):
                     loss = loss + aux_loss
@@ -279,17 +420,34 @@ class Exp_Main(Exp_Basic):
 
                 if not isinstance(raw_cluster_loss, float):
                     raw_cluster_loss_value = raw_cluster_loss.item()
+
+                if not isinstance(raw_cluster_loss_s, float):
+                    raw_cluster_loss_s_value = raw_cluster_loss_s.item()
+
+                if not isinstance(raw_cluster_loss_t, float):
+                    raw_cluster_loss_t_value = raw_cluster_loss_t.item()
+
+                self._maybe_diagnose_ccm(
+                    epoch=epoch,
+                    batch_idx=i,
+                    path=path,
+                    pred_loss=pred_loss,
+                    aux_loss=aux_loss,
+                )
+
                 train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
                     print(
-                        "\titers: {0}, epoch: {1} | loss: {2:.7f} pred: {3:.7f} aux: {4:.7f} raw_cluster: {5:.7f}".format(
+                        "\titers: {0}, epoch: {1} | loss: {2:.7f} pred: {3:.7f} aux: {4:.7f} raw_cluster: {5:.7f} raw_s: {6:.7f} raw_t: {7:.7f}".format(
                             i + 1,
                             epoch + 1,
                             loss.item(),
                             pred_loss.item(),
                             aux_loss_value,
-                            raw_cluster_loss_value
+                            raw_cluster_loss_value,
+                            raw_cluster_loss_s_value,
+                            raw_cluster_loss_t_value,
                         )
                     )
                     speed = (time.time() - time_now) / iter_count
@@ -301,28 +459,24 @@ class Exp_Main(Exp_Basic):
                 loss.backward()
                 model_optim.step()
 
-            # train_times.append(train_time / len(train_loader)) # For computational cost analysis
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
 
             print(
-                "Last batch loss details | pred: {:.7f} aux: {:.7f} raw_cluster: {:.7f}".format(
+                "Last batch loss details | pred: {:.7f} aux: {:.7f} raw_cluster: {:.7f} raw_s: {:.7f} raw_t: {:.7f}".format(
                     pred_loss.item(),
                     aux_loss_value,
-                    raw_cluster_loss_value
+                    raw_cluster_loss_value,
+                    raw_cluster_loss_s_value,
+                    raw_cluster_loss_t_value,
                 )
             )
 
             train_loss = np.average(train_loss)
 
-            # Validation uses forecasting loss only.
-            # Do not add auxiliary cluster loss here, otherwise early stopping may be misled.
             vali_criterion = self._select_vali_loss(mse_criterion, mae_criterion)
 
-            # If use_loss_ratio=0, this is unweighted validation loss.
-            # If use_loss_ratio=1 and is_test=False, this keeps original xPatch validation style.
             vali_loss = self.vali(vali_data, vali_loader, vali_criterion, is_test=False)
 
-            # test_loss is only for logging, always unweighted MSE.
             test_loss = self.vali(test_data, test_loader, mse_criterion, is_test=True)
 
             print(
@@ -343,10 +497,6 @@ class Exp_Main(Exp_Basic):
 
             adjust_learning_rate(model_optim, epoch + 1, self.args)
 
-            # print('Alpha:', self.model.decomp.ma.alpha) # Print the learned alpha
-            # print('Beta:', self.model.decomp.ma.beta)   # Print the learned beta
-
-        # print("Training time: {}".format(np.sum(train_times) / len(train_times))) # For computational cost analysis
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
         os.remove(best_model_path)
@@ -369,7 +519,6 @@ class Exp_Main(Exp_Basic):
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
-        # test_time = 0 # For computational cost analysis
         self.model.eval()
 
         with torch.no_grad():
@@ -380,17 +529,13 @@ class Exp_Main(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat(
                     [batch_y[:, :self.args.label_len, :], dec_inp],
                     dim=1
                 ).float().to(self.device)
 
-                # encoder - decoder
-                # temp = time.time() # For computational cost analysis
                 outputs = self.model(batch_x)
-                # test_time += time.time() - temp # For computational cost analysis
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
@@ -411,12 +556,8 @@ class Exp_Main(Exp_Basic):
                     pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
                     visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
 
-        # print("Inference time: {}".format(test_time / len(test_loader))) # For computational cost analysis
         preds = np.array(preds)
         trues = np.array(trues)
-
-        # preds = np.concatenate(preds, axis=0) # without the "drop-last" trick
-        # trues = np.concatenate(trues, axis=0) # without the "drop-last" trick
 
         preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
         trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
@@ -430,10 +571,5 @@ class Exp_Main(Exp_Basic):
         f.write('\n')
         f.write('\n')
         f.close()
-
-        # np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe, rse, corr]))
-        # np.save(folder_path + 'pred.npy', preds)
-        # np.save(folder_path + 'true.npy', trues)
-        # np.save(folder_path + 'x.npy', inputx)
 
         return
